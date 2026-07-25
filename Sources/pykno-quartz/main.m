@@ -327,6 +327,16 @@ static BOOL ProcessFile(NSString *path, Options *options, NSError **error) {
         [fm removeItemAtURL:temporaryURL error:nil];
         return NO;
     }
+    NSDictionary<NSFileAttributeKey, id> *sourceAttributes =
+        [fm attributesOfItemAtPath:inputURL.path error:nil];
+    NSMutableDictionary<NSFileAttributeKey, id> *preservedAttributes =
+        [NSMutableDictionary dictionary];
+    for (NSFileAttributeKey key in @[
+        NSFileModificationDate, NSFileCreationDate, NSFilePosixPermissions
+    ]) {
+        if (sourceAttributes[key]) preservedAttributes[key] = sourceAttributes[key];
+    }
+    [fm setAttributes:preservedAttributes ofItemAtPath:temporaryURL.path error:nil];
     if (rename(temporaryURL.fileSystemRepresentation,
                outputURL.fileSystemRepresentation) != 0) {
         *error = CLIError(4, [NSString stringWithFormat:

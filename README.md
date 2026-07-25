@@ -42,7 +42,9 @@ Run ./pykno --help for every option.
 
 ## How it works
 
-The Python engine finds raster image XObjects, decodes eligible unmasked 8-bit RGB or grayscale images, downsamples images above the requested resolution, and replaces them with locally encoded JPEG streams. Pages are not redrawn. Text, vectors, links, forms, annotations, outlines, metadata, page boxes, and encryption are preserved.
+The Python engine finds raster image XObjects, decodes eligible unmasked 8-bit RGB or grayscale images, and calculates effective resolution from each image's page-space transformation matrix. It accounts for shared images and images nested in Form XObjects, downsamples images above the requested resolution, and replaces them with locally encoded JPEG streams only when the replacement is smaller. Malformed or untraceable content falls back to a conservative page-size cap.
+
+Pages are not redrawn. Text, vectors, links, forms, annotations, outlines, metadata, page boxes, and encryption are preserved.
 
 Images with transparency, masks, unusual bit depths, or unsupported color modes are deliberately left unchanged.
 

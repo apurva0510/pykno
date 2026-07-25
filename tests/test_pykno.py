@@ -8,6 +8,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import pikepdf
+from PIL import Image
+
 
 MODULE_PATH = Path(__file__).parents[1] / "pykno.py"
 SPEC = importlib.util.spec_from_file_location("pykno_module", MODULE_PATH)
@@ -15,6 +18,34 @@ assert SPEC is not None and SPEC.loader is not None
 pykno = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pykno
 SPEC.loader.exec_module(pykno)
+
+
+def compression_args(**overrides: object) -> argparse.Namespace:
+    values = {
+        "force": False,
+        "password_prompt": False,
+        "strip_metadata": False,
+        "suffix": "-compressed",
+        "output": None,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+def make_image_pdf(path: Path) -> None:
+    image = Image.new("RGB", (1200, 900), (35, 90, 145))
+    image.save(path, "PDF", resolution=300)
+
+
+def make_image_xobject(pdf: pikepdf.Pdf) -> pikepdf.Object:
+    image = pdf.make_stream(bytes((30, 80, 140)) * (1200 * 900))
+    image["/Type"] = pikepdf.Name.XObject
+    image["/Subtype"] = pikepdf.Name.Image
+    image["/Width"] = 1200
+    image["/Height"] = 900
+    image["/ColorSpace"] = pikepdf.Name.DeviceRGB
+    image["/BitsPerComponent"] = 8
+    return image
 
 
 class SettingsTests(unittest.TestCase):
@@ -32,6 +63,88 @@ class SettingsTests(unittest.TestCase):
         result = pykno.output_path(Path("docs/report.PDF"), args)
         self.assertEqual(result.name, "report-small.pdf")
         self.assertEqual(result.parent, Path("~/exports").expanduser())
+
+    def test_batch_rejects_duplicate_destinations_before_processing(self) -> None:
+        args = compression_args(output=Path("exports"))
+        inputs = [Path("first/report.pdf"), Path("second/report.pdf")]
+        with self.assertRaisesRegex(RuntimeError, "same output"):
+            pykno.planned_jobs(inputs, args)
+
+
+class PdfCompressionTests(unittest.TestCase):
+    def test_nested_form_and_shared_placements_use_largest_rendered_size(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        image = make_image_xobject(pdf)
+        form = pdf.make_stream(b"q 200 0 0 100 0 0 cm /Image Do Q")
+        form["/Type"] = pikepdf.Name.XObject
+        form["/Subtype"] = pikepdf.Name.Form
+        form["/BBox"] = pikepdf.Array((0, 0, 200, 100))
+        form["/Resources"] = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Image=image)
+        )
+
+        small_page = pdf.add_blank_page(page_size=(612, 792))
+        small_page.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Form=form)
+        )
+        small_page.Contents = pdf.make_stream(b"q 0.5 0 0 0.5 0 0 cm /Form Do Q")
+
+        large_page = pdf.add_blank_page(page_size=(612, 792))
+        large_page.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Image=image)
+        )
+        large_page.Contents = pdf.make_stream(b"q 288 0 0 144 0 0 cm /Image Do Q")
+
+        caps = pykno.image_dimension_caps(pdf, 144)
+        self.assertEqual(caps[pykno.object_identity(image)], (576, 288))
+
+    def test_uses_rendered_image_size_instead_of_largest_page(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.pdf"
+            destination = root / "compressed.pdf"
+            make_image_pdf(source)
+            with pikepdf.open(source, allow_overwriting_input=True) as pdf:
+                pdf.add_blank_page(page_size=(7200, 7200))
+                pdf.save(source)
+
+            stats = pykno.compress_pdf(
+                source,
+                destination,
+                pykno.Settings(144, 72),
+                compression_args(),
+            )
+
+            with pikepdf.open(destination) as output:
+                images = list(output.pages[0].get_images().values())
+                self.assertEqual(len(output.pages), 2)
+                self.assertEqual(len(images), 1)
+                self.assertLessEqual(int(images[0]["/Width"]), 576)
+                self.assertLessEqual(int(images[0]["/Height"]), 432)
+            self.assertEqual(stats["changed"], 1)
+
+    def test_strip_metadata_removes_info_and_xmp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.pdf"
+            destination = root / "compressed.pdf"
+            make_image_pdf(source)
+            with pikepdf.open(source, allow_overwriting_input=True) as pdf:
+                pdf.docinfo["/Author"] = "Private"
+                with pdf.open_metadata() as metadata:
+                    metadata["dc:title"] = "Private title"
+                pdf.save(source)
+
+            pykno.compress_pdf(
+                source,
+                destination,
+                pykno.Settings(144, 72),
+                compression_args(strip_metadata=True),
+            )
+
+            with pikepdf.open(destination) as output:
+                self.assertIsNone(output.Root.get("/Metadata"))
+                self.assertNotIn("/Author", output.docinfo)
 
 
 class QuartzFallbackTests(unittest.TestCase):

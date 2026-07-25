@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import math
 import os
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from typing import Iterator
 
 import pikepdf
 from PIL import Image
@@ -104,24 +106,105 @@ def open_pdf(path: Path, prompt: bool) -> tuple[pikepdf.Pdf, str]:
             raise RuntimeError("incorrect PDF password") from None
 
 
-def page_dimension_cap(pdf: pikepdf.Pdf, dpi: int) -> int:
+def page_dimension_cap(pdf: pikepdf.Pdf, dpi: int) -> tuple[int, int]:
     """Conservative cap: requested DPI for the largest full page in the PDF."""
-    largest_points = 0.0
+    largest_width = 0.0
+    largest_height = 0.0
     for page in pdf.pages:
         box = [float(v) for v in page.MediaBox]
-        largest_points = max(
-            largest_points, abs(box[2] - box[0]), abs(box[3] - box[1])
-        )
-    return max(1, round(largest_points * dpi / 72.0))
+        user_unit = float(page.obj.get("/UserUnit", 1))
+        largest_width = max(largest_width, abs(box[2] - box[0]) * user_unit)
+        largest_height = max(largest_height, abs(box[3] - box[1]) * user_unit)
+    return (
+        max(1, math.ceil(largest_width * dpi / 72.0)),
+        max(1, math.ceil(largest_height * dpi / 72.0)),
+    )
 
 
-def filter_names(obj: pikepdf.Object) -> set[str]:
-    value = obj.get("/Filter")
-    if value is None:
-        return set()
-    if isinstance(value, pikepdf.Array):
-        return {str(item) for item in value}
-    return {str(value)}
+def object_identity(obj: pikepdf.Object) -> tuple[int, int] | int:
+    identity: tuple[int, int] | int = obj.objgen
+    return id(obj) if identity == (0, 0) else identity
+
+
+def _image_placements(
+    content: pikepdf.Page | pikepdf.Object,
+    resources: pikepdf.Object,
+    initial_matrix: pikepdf.Matrix,
+    active_forms: set[tuple[int, int] | int],
+) -> Iterator[tuple[pikepdf.Object, pikepdf.Matrix]]:
+    """Yield images and their page-space matrices, including nested forms."""
+    stack = [initial_matrix]
+    for instruction in pikepdf.parse_content_stream(
+        content, operators="q Q cm Do"
+    ):
+        operator = str(instruction.operator)
+        operands = instruction.operands
+        if operator == "q":
+            stack.append(stack[-1])
+        elif operator == "Q":
+            if len(stack) > 1:
+                stack.pop()
+        elif operator == "cm":
+            if len(operands) == 6:
+                stack[-1] = stack[-1] @ pikepdf.Matrix(*operands)
+        elif operator == "Do" and operands:
+            xobjects = resources.get("/XObject")
+            if xobjects is None:
+                continue
+            drawn = xobjects.get(operands[0])
+            if drawn is None:
+                continue
+            subtype = drawn.get("/Subtype")
+            if subtype == pikepdf.Name.Image:
+                yield drawn, stack[-1]
+            elif subtype == pikepdf.Name.Form:
+                identity = object_identity(drawn)
+                if identity in active_forms:
+                    continue
+                form_resources = drawn.get("/Resources", resources)
+                form_matrix = pikepdf.Matrix(
+                    *drawn.get("/Matrix", (1, 0, 0, 1, 0, 0))
+                )
+                yield from _image_placements(
+                    drawn,
+                    form_resources,
+                    stack[-1] @ form_matrix,
+                    active_forms | {identity},
+                )
+
+
+def image_dimension_caps(
+    pdf: pikepdf.Pdf, dpi: int
+) -> dict[tuple[int, int] | int, tuple[int, int]]:
+    """Calculate pixel caps from each image's largest rendered placement."""
+    caps: dict[tuple[int, int] | int, tuple[int, int]] = {}
+    for page in pdf.pages:
+        try:
+            resources = page.resources
+        except AttributeError:
+            continue
+        user_unit = float(page.obj.get("/UserUnit", 1))
+        try:
+            placements = _image_placements(
+                page, resources, pikepdf.Matrix.identity(), set()
+            )
+            for image, matrix in placements:
+                width_points = math.hypot(matrix.a, matrix.b) * user_unit
+                height_points = math.hypot(matrix.c, matrix.d) * user_unit
+                cap = (
+                    max(1, math.ceil(width_points * dpi / 72.0)),
+                    max(1, math.ceil(height_points * dpi / 72.0)),
+                )
+                identity = object_identity(image)
+                previous = caps.get(identity, (0, 0))
+                caps[identity] = (
+                    max(previous[0], cap[0]),
+                    max(previous[1], cap[1]),
+                )
+        except (pikepdf.PdfError, TypeError, ValueError, NotImplementedError):
+            # Malformed content is still handled by the conservative fallback.
+            continue
+    return caps
 
 
 def raw_length(obj: pikepdf.Object) -> int:
@@ -132,7 +215,7 @@ def raw_length(obj: pikepdf.Object) -> int:
 
 
 def compress_image(
-    obj: pikepdf.Object, *, max_dimension: int, quality: int
+    obj: pikepdf.Object, *, max_size: tuple[int, int], quality: int
 ) -> tuple[bool, int, int, str]:
     if obj.get("/Subtype") != pikepdf.Name.Image:
         return False, 0, 0, "not an image"
@@ -161,9 +244,9 @@ def compress_image(
         return False, before, before, f"unsupported color mode {image.mode}"
 
     original_size = image.size
-    resized = max(image.size) > max_dimension
+    resized = image.width > max_size[0] or image.height > max_size[1]
     if resized:
-        image.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+        image.thumbnail(max_size, Image.Resampling.LANCZOS)
 
     encoded = BytesIO()
     image.save(
@@ -176,10 +259,8 @@ def compress_image(
     )
     jpeg = encoded.getvalue()
 
-    # Avoid generational loss and file growth for an already smaller JPEG.
-    if not resized and "/DCTDecode" in filter_names(obj) and len(jpeg) >= before:
-        return False, before, before, "existing JPEG is smaller"
-    if not resized and len(jpeg) >= before:
+    # Never make the document larger merely to enforce the requested DPI cap.
+    if len(jpeg) >= before:
         return False, before, before, "replacement is not smaller"
 
     obj.write(jpeg, filter=pikepdf.Name.DCTDecode)
@@ -225,7 +306,8 @@ def compress_pdf(
     try:
         encrypted = pdf.is_encrypted
         source_pages = len(pdf.pages)
-        max_dimension = page_dimension_cap(pdf, settings.dpi)
+        fallback_cap = page_dimension_cap(pdf, settings.dpi)
+        placement_caps = image_dimension_caps(pdf, settings.dpi)
         visited: set[tuple[int, int] | int] = set()
         stats = {
             "found": 0,
@@ -237,15 +319,15 @@ def compress_pdf(
 
         for page in pdf.pages:
             for obj in page.get_images(recursive=True).values():
-                identity: tuple[int, int] | int = obj.objgen
-                if identity == (0, 0):
-                    identity = id(obj)
+                identity = object_identity(obj)
                 if identity in visited:
                     continue
                 visited.add(identity)
                 stats["found"] += 1
                 changed, before, after, _detail = compress_image(
-                    obj, max_dimension=max_dimension, quality=settings.quality
+                    obj,
+                    max_size=placement_caps.get(identity, fallback_cap),
+                    quality=settings.quality,
                 )
                 stats["before"] += before
                 stats["after"] += after
@@ -275,23 +357,23 @@ def compress_pdf(
         pdf.close()
 
         try:
-            check = pikepdf.open(temporary, password=password)
-            if len(check.pages) != source_pages or len(check.pages) == 0:
-                raise RuntimeError(
-                    f"validation failed: expected {source_pages} pages, "
-                    f"found {len(check.pages)}"
-                )
-            syntax_issues = check.check_pdf_syntax()
-            if syntax_issues:
-                raise RuntimeError(
-                    "output validation reported: " + "; ".join(syntax_issues)
-                )
-            check.close()
+            with pikepdf.open(temporary, password=password) as check:
+                output_pages = len(check.pages)
+                if output_pages != source_pages or output_pages == 0:
+                    raise RuntimeError(
+                        f"validation failed: expected {source_pages} pages, "
+                        f"found {output_pages}"
+                    )
+                syntax_issues = check.check_pdf_syntax()
+                if syntax_issues:
+                    raise RuntimeError(
+                        "output validation reported: " + "; ".join(syntax_issues)
+                    )
         except pikepdf.PdfError as exc:
             raise RuntimeError(f"output validation failed: {exc}") from exc
 
+        shutil.copystat(source, temporary)
         os.replace(temporary, destination)
-        shutil.copystat(source, destination)
     finally:
         pdf.close()
         if temporary is not None:
@@ -353,7 +435,6 @@ def compress_quartz(
         raise RuntimeError(
             "Quartz output validation reported: " + "; ".join(syntax_issues)
         )
-    shutil.copystat(source, destination)
 
 
 def try_quartz_fallback(
@@ -399,6 +480,26 @@ def human_size(value: int) -> str:
     raise AssertionError
 
 
+def planned_jobs(
+    inputs: list[Path], args: argparse.Namespace
+) -> list[tuple[Path, Path]]:
+    """Resolve batch paths and reject collisions before writing any output."""
+    jobs: list[tuple[Path, Path]] = []
+    destinations: dict[Path, Path] = {}
+    for source_arg in inputs:
+        source = source_arg.expanduser()
+        destination = output_path(source, args).expanduser().resolve()
+        previous = destinations.get(destination)
+        if previous is not None:
+            raise RuntimeError(
+                f"multiple inputs target the same output {destination}: "
+                f"{previous} and {source}"
+            )
+        destinations[destination] = source
+        jobs.append((source, destination))
+    return jobs
+
+
 def main() -> int:
     args = parser().parse_args()
     try:
@@ -406,10 +507,14 @@ def main() -> int:
     except ValueError as exc:
         parser().error(str(exc))
 
+    try:
+        jobs = planned_jobs(args.inputs, args)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
     failures = 0
-    for source_arg in args.inputs:
-        source = source_arg.expanduser()
-        destination = output_path(source, args)
+    for source, destination in jobs:
         try:
             before = source.stat().st_size
             stats: dict[str, int] | None = None
