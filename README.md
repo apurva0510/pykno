@@ -1,44 +1,85 @@
 # Pykno
 
-Pykno is a private, object-preserving command-line PDF compressor. It runs entirely on your Mac and contains no networking code. Original files are never overwritten.
+Pykno is a local-first, object-preserving command-line PDF compressor for macOS. It contains no networking code, performs compression entirely on your Mac, and never overwrites an original file.
 
 The recommended engine uses local Python packages:
 
 - pikepdf, which embeds the QPDF PDF parser/writer;
 - Pillow, which decodes, resizes, and JPEG-encodes raster images.
 
-These packages do not upload or remotely process documents. The setup command contacts PyPI only to download and install software into this project's local .venv. PDF processing itself makes no network requests.
+These packages do not upload or remotely process documents. Installation tools may contact their package indexes to download dependencies; PDF processing itself makes no network requests.
 
-## Setup
+## Install
 
-    ./setup-pykno
+Until versioned packages are published, clone the repository and install an isolated command with `pipx`:
+
+```Shell
+pipx install .
+pykno --version
+```
+
+For development, create the repository-local environment:
+
+```Shell
+./setup-pykno
+```
+
+This creates an isolated `.venv` and installs an editable `pykno` command.
 
 ## Quick start
 
-    ./pykno confidential.pdf
+```Shell
+./pykno confidential.pdf
+```
 
 The default balanced mode caps full-page images at 144 dpi and uses 72 percent JPEG quality. It writes confidential-compressed.pdf beside the original.
 
 For stronger compression with explicit image settings:
 
-    ./pykno --preset small scan.pdf
-    ./pykno --preset print report.pdf
+```Shell
+./pykno --preset small scan.pdf
+./pykno --preset print report.pdf
+```
 
 Batch processing and a separate output folder:
 
-    ./pykno --preset balanced --output ./compressed one.pdf two.pdf three.pdf
+```Shell
+./pykno --preset balanced --output ./compressed one.pdf two.pdf three.pdf
+```
 
 Custom image settings:
 
-    ./pykno --dpi 110 --quality 62 confidential.pdf
+```Shell
+./pykno --dpi 110 --quality 62 confidential.pdf
+```
 
 Choose the processing engine through the same command:
 
-    ./pykno --engine objects document.pdf
-    ./pykno --engine quartz document.pdf
-    ./pykno --engine auto document.pdf
+```Shell
+./pykno --engine objects document.pdf
+./pykno --engine quartz document.pdf
+./pykno --engine auto document.pdf
+```
 
 Run ./pykno --help for every option.
+
+## Finder Quick Action
+
+After installing Pykno somewhere outside `~/Documents`, add the configurable Finder action with:
+
+```Shell
+pykno --install-quick-action
+```
+
+Right-click one or more PDFs and choose **Quick Actions → Compress with Pykno**. The action prompts once for Small, Balanced, Print, or custom DPI and JPEG quality settings.
+
+Remove it with:
+
+```Shell
+pykno --uninstall-quick-action
+```
+
+Finder restricts workflows from reading development tools inside `~/Documents`. A package-manager installation avoids that macOS privacy boundary.
 
 ## How it works
 
@@ -50,7 +91,9 @@ Images with transparency, masks, unusual bit depths, or unsupported color modes 
 
 The Quartz redraw implementation is built into the main command:
 
-    ./pykno --engine quartz --preset small document.pdf
+```Shell
+./pykno --engine quartz --preset small document.pdf
+```
 
 Quartz handles some image types the object-preserving engine skips, but may discard links, forms, outlines, attachments, tags, and other document-level structures.
 
@@ -75,9 +118,39 @@ For highly sensitive documents, remember that Spotlight, Time Machine, cloud-syn
 
 Dependencies are isolated under .venv and listed in requirements.txt. To rebuild the environment:
 
-    python3 -m venv .venv
-    .venv/bin/python -m pip install -r requirements.txt
+```Shell
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+## Platform support
+
+The object-preserving engine is Python-based and designed to remain portable. The Quartz fallback and Finder Quick Action require macOS. On other platforms, `--engine auto` safely remains on the object engine and `--engine quartz` reports that Quartz is unavailable.
+
+The Quartz helper compiles on first use and requires the Xcode Command Line Tools.
+
+## Known limitations
+
+- Images with masks, transparency, unusual bit depths, or unsupported color modes are skipped.
+- The object engine does not perform OCR, bitonal conversion, or vector-stream simplification.
+- The Quartz engine may discard links, forms, outlines, attachments, tags, and other document-level structures.
+- Effective-DPI analysis handles transformation matrices and nested Form XObjects, but malformed or untraceable content uses a conservative fallback.
+- Compression is lossy for images that are replaced with JPEG. Keep the original PDF.
 
 ## Scope
 
-This is a clean-room local implementation based on documented macOS APIs and observable PDFOptim behavior. See REVERSE_ENGINEERING.md for the technical analysis and the roadmap for a more advanced object-preserving Graphics engine.
+This is an independent clean-room implementation based on documented PDF and macOS APIs plus observable application behavior. It contains no copied proprietary source code or bundled third-party application assets.
+
+## Development
+
+Run the test suite with:
+
+```Shell
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.
+
+## License
+
+Pykno is available under the [Apache License 2.0](LICENSE).

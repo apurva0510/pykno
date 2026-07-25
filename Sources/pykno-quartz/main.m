@@ -32,7 +32,7 @@ typedef NS_ENUM(NSInteger, Engine) { EnginePDFKit, EngineQuartz };
 
 static void PrintUsage(void) {
     fprintf(stderr,
-        "pykno - private, local PDF compression\n\n"
+        "pykno - local-first PDF compression\n\n"
         "Usage:\n"
         "  pykno [options] file.pdf [more.pdf ...]\n\n"
         "Options:\n"

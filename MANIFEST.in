@@ -1,0 +1,10 @@
+include CHANGELOG.md
+include CONTRIBUTING.md
+include LICENSE
+include SECURITY.md
+include requirements.txt
+include setup-pykno
+include pykno
+include pykno-quartz
+recursive-include Sources *.m
+recursive-include tests *.py

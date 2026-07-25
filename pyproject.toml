@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pykno"
+version = "0.1.0"
+description = "Local, object-preserving PDF image compression"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "Apurva Aggarwal" }]
+keywords = ["pdf", "compression", "qpdf", "macos", "privacy"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "pikepdf>=10.10,<11",
+  "Pillow>=12.3,<13",
+]
+
+[project.urls]
+Homepage = "https://github.com/apurva0510/pykno"
+Repository = "https://github.com/apurva0510/pykno"
+Issues = "https://github.com/apurva0510/pykno/issues"
+
+[project.scripts]
+pykno = "pykno:main"
+
+[tool.setuptools]
+py-modules = ["pykno"]
+
+[tool.setuptools.data-files]
+"share/pykno" = ["pykno-quartz"]
+"share/pykno/Sources/pykno-quartz" = ["Sources/pykno-quartz/main.m"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

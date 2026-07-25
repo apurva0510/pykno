@@ -5,3 +5,6 @@ tmp/
 output/
 *-compressed.pdf
 REVERSE_ENGINEERING.md
+build/
+dist/
+*.egg-info/

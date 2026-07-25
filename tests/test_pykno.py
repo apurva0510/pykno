@@ -49,6 +49,9 @@ def make_image_xobject(pdf: pikepdf.Pdf) -> pikepdf.Object:
 
 
 class SettingsTests(unittest.TestCase):
+    def test_version_is_publicly_available(self) -> None:
+        self.assertRegex(pykno.__version__, r"^\d+\.\d+\.\d+$")
+
     def test_preset_can_be_partially_overridden(self) -> None:
         args = argparse.Namespace(preset="small", dpi=120, quality=None)
         self.assertEqual(pykno.checked_settings(args), pykno.Settings(120, 50))
@@ -145,6 +148,54 @@ class PdfCompressionTests(unittest.TestCase):
             with pikepdf.open(destination) as output:
                 self.assertIsNone(output.Root.get("/Metadata"))
                 self.assertNotIn("/Author", output.docinfo)
+
+
+class QuickActionTests(unittest.TestCase):
+    def test_workflow_is_pdf_only_and_contains_no_username(self) -> None:
+        with mock.patch.object(pykno, "__file__", "/opt/pykno/pykno.py"):
+            with mock.patch("sys.executable", "/opt/pykno/bin/python"):
+                with mock.patch.object(pykno.shutil, "which", return_value=None):
+                    command = pykno._quick_action_command()
+        document = pykno._quick_action_document(command)
+        info = pykno._quick_action_info()
+
+        self.assertIn("/opt/pykno/bin/python", command)
+        self.assertNotIn("apaggarwal", command)
+        self.assertEqual(info["NSServices"][0]["NSSendFileTypes"], ["com.adobe.pdf"])
+        self.assertEqual(
+            document["workflowMetaData"]["serviceApplicationBundleID"],
+            "com.apple.finder",
+        )
+
+    def test_documents_checkout_is_rejected_for_finder_install(self) -> None:
+        module = Path.home() / "Documents" / "Code" / "pykno" / "pykno.py"
+        with mock.patch.object(pykno, "__file__", str(module)):
+            with self.assertRaisesRegex(RuntimeError, "Finder cannot reliably"):
+                pykno._quick_action_command()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Finder is macOS-only")
+    def test_quick_action_install_and_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with mock.patch.object(pykno.Path, "home", return_value=home):
+                with mock.patch.object(pykno, "__file__", "/opt/pykno/pykno.py"):
+                    with mock.patch("sys.executable", "/opt/pykno/bin/python"):
+                        with mock.patch.object(
+                            pykno.shutil, "which", return_value=None
+                        ):
+                            with mock.patch.object(pykno, "refresh_services"):
+                                pykno.install_quick_action()
+                                workflow = pykno.quick_action_path()
+                                with (workflow / "Contents" / "Info.plist").open(
+                                    "rb"
+                                ) as stream:
+                                    info = pykno.plistlib.load(stream)
+                                self.assertEqual(
+                                    info["NSServices"][0]["NSSendFileTypes"],
+                                    ["com.adobe.pdf"],
+                                )
+                                pykno.uninstall_quick_action()
+                                self.assertFalse(workflow.exists())
 
 
 class QuartzFallbackTests(unittest.TestCase):

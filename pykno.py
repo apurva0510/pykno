@@ -7,10 +7,13 @@ import argparse
 import getpass
 import math
 import os
+import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -18,6 +21,9 @@ from typing import Iterator
 
 import pikepdf
 from PIL import Image
+
+
+__version__ = "0.1.0"
 
 
 @dataclass(frozen=True)
@@ -42,7 +48,8 @@ def parser() -> argparse.ArgumentParser:
             "are preserved because pages are not redrawn."
         )
     )
-    p.add_argument("inputs", nargs="+", type=Path, help="PDF files to process")
+    p.add_argument("inputs", nargs="*", type=Path, help="PDF files to process")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument(
         "--preset", choices=PRESETS, default="balanced", help="default: balanced"
     )
@@ -71,6 +78,17 @@ def parser() -> argparse.ArgumentParser:
         "--strip-metadata",
         action="store_true",
         help="remove the document Info dictionary and XMP metadata",
+    )
+    service = p.add_mutually_exclusive_group()
+    service.add_argument(
+        "--install-quick-action",
+        action="store_true",
+        help="install the configurable Finder Quick Action",
+    )
+    service.add_argument(
+        "--uninstall-quick-action",
+        action="store_true",
+        help="remove the Finder Quick Action",
     )
     return p
 
@@ -399,7 +417,9 @@ def compress_quartz(
         raise RuntimeError("refusing to overwrite the input file")
     if destination.exists() and not (args.force or replace):
         raise RuntimeError(f"output exists (use --force): {destination}")
-    executable = Path(__file__).resolve().parent / "pykno-quartz"
+    if sys.platform != "darwin":
+        raise RuntimeError("the Quartz engine is available only on macOS")
+    executable = quartz_executable()
     if not executable.is_file():
         raise RuntimeError(f"bundled Quartz engine is missing: {executable}")
     command = [
@@ -480,6 +500,175 @@ def human_size(value: int) -> str:
     raise AssertionError
 
 
+def quartz_executable() -> Path:
+    """Locate Quartz assets in a source checkout or installed Python package."""
+    candidates = (
+        Path(__file__).resolve().parent / "pykno-quartz",
+        Path(sys.prefix) / "share" / "pykno" / "pykno-quartz",
+    )
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def quick_action_path() -> Path:
+    return Path.home() / "Library" / "Services" / "Compress with Pykno.workflow"
+
+
+def _quick_action_command() -> str:
+    module_path = Path(__file__).resolve()
+    documents = Path.home() / "Documents"
+    if module_path.is_relative_to(documents):
+        raise RuntimeError(
+            "Finder cannot reliably run code from Documents. Install Pykno with "
+            "pipx or Homebrew, then rerun --install-quick-action."
+        )
+    installed_command = shutil.which("pykno")
+    invocation_parts = (
+        (installed_command,)
+        if installed_command
+        else (sys.executable, "-m", "pykno")
+    )
+    invocation = " ".join(shlex.quote(part) for part in invocation_parts)
+    return f'''choice=$(/usr/bin/osascript \\
+  -e 'set picked to choose from list {{"Small — 96 dpi / 50%", "Balanced — 144 dpi / 72%", "Print — 220 dpi / 85%", "Custom…"}} with title "Pykno" with prompt "Choose compression settings" default items {{"Balanced — 144 dpi / 72%"}}' \\
+  -e 'if picked is false then return "Cancel"' \\
+  -e 'return item 1 of picked') || exit 0
+
+case "$choice" in
+  "Small —"*) settings=(--preset small) ;;
+  "Balanced —"*) settings=(--preset balanced) ;;
+  "Print —"*) settings=(--preset print) ;;
+  "Custom…")
+    dpi=$(/usr/bin/osascript -e 'text returned of (display dialog "Image resolution cap (36–600 dpi)" with title "Pykno — Custom" default answer "144" buttons {{"Cancel", "Continue"}} default button "Continue")') || exit 0
+    quality=$(/usr/bin/osascript -e 'text returned of (display dialog "JPEG quality (0–100)" with title "Pykno — Custom" default answer "72" buttons {{"Cancel", "Compress"}} default button "Compress")') || exit 0
+    if [[ "$dpi" != <-> || "$dpi" -lt 36 || "$dpi" -gt 600 || "$quality" != <-> || "$quality" -lt 0 || "$quality" -gt 100 ]]; then
+      /usr/bin/osascript -e 'display alert "Invalid Pykno settings" message "DPI must be 36–600 and quality must be 0–100." as critical'
+      exit 1
+    fi
+    settings=(--dpi "$dpi" --quality "$quality") ;;
+  *) exit 0 ;;
+esac
+
+failures=0
+for pdf in "$@"; do
+  if ! result=$({invocation} --engine auto "${{settings[@]}}" "$pdf" 2>&1); then
+    failures=1
+    /usr/bin/osascript \\
+      -e 'on run argv' \\
+      -e 'display alert "Pykno compression failed" message (item 1 of argv) as critical' \\
+      -e 'end run' "$result"
+  fi
+done
+exit "$failures"'''
+
+
+def _quick_action_document(command: str) -> dict[str, object]:
+    action_uuid = str(uuid.uuid4()).upper()
+    return {
+        "actions": [
+            {
+                "action": {
+                    "ActionBundlePath": (
+                        "/System/Library/Automator/Run Shell Script.action"
+                    ),
+                    "ActionName": "Run Shell Script",
+                    "ActionParameters": {
+                        "CheckedForUserDefaultShell": False,
+                        "COMMAND_STRING": command,
+                        "inputMethod": 1,
+                        "shell": "/bin/zsh",
+                        "source": "",
+                    },
+                    "AMAccepts": {
+                        "Container": "List",
+                        "Optional": True,
+                        "Types": ["com.apple.cocoa.string"],
+                    },
+                    "AMActionVersion": "2.0.3",
+                    "AMApplication": ["Automator"],
+                    "AMParameterProperties": {
+                        key: {}
+                        for key in (
+                            "CheckedForUserDefaultShell",
+                            "COMMAND_STRING",
+                            "inputMethod",
+                            "shell",
+                            "source",
+                        )
+                    },
+                    "AMProvides": {
+                        "Container": "List",
+                        "Types": ["com.apple.cocoa.string"],
+                    },
+                    "BundleIdentifier": "com.apple.RunShellScript",
+                    "Class Name": "RunShellScriptAction",
+                    "UUID": action_uuid,
+                },
+                "isViewVisible": True,
+            }
+        ],
+        "AMApplicationBuild": "523",
+        "AMApplicationVersion": "2.10",
+        "AMDocumentVersion": "2",
+        "connectors": {},
+        "workflowMetaData": {
+            "serviceApplicationBundleID": "com.apple.finder",
+            "serviceApplicationPath": "/System/Library/CoreServices/Finder.app",
+            "serviceInputTypeIdentifier": "com.apple.Automator.fileSystemObject",
+            "serviceOutputTypeIdentifier": "com.apple.Automator.nothing",
+            "serviceProcessesInput": 0,
+            "workflowTypeIdentifier": "com.apple.Automator.servicesMenu",
+        },
+    }
+
+
+def _quick_action_info() -> dict[str, object]:
+    return {
+        "NSServices": [
+            {
+                "NSMenuItem": {"default": "Compress with Pykno"},
+                "NSMessage": "runWorkflowAsService",
+                "NSRequiredContext": {
+                    "NSApplicationIdentifier": "com.apple.finder"
+                },
+                "NSSendFileTypes": ["com.adobe.pdf"],
+            }
+        ]
+    }
+
+
+def refresh_services() -> None:
+    pbs = Path("/System/Library/CoreServices/pbs")
+    if pbs.is_file():
+        subprocess.run([pbs, "-flush"], check=False)
+        subprocess.run([pbs, "-update"], check=False)
+
+
+def install_quick_action() -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("the Finder Quick Action is available only on macOS")
+    destination = quick_action_path()
+    contents = destination / "Contents"
+    contents.mkdir(parents=True, exist_ok=True)
+    with (contents / "Info.plist").open("wb") as stream:
+        plistlib.dump(_quick_action_info(), stream)
+    with (contents / "document.wflow").open("wb") as stream:
+        plistlib.dump(_quick_action_document(_quick_action_command()), stream)
+    refresh_services()
+    print(f"installed: {destination}")
+
+
+def uninstall_quick_action() -> None:
+    if sys.platform != "darwin":
+        raise RuntimeError("the Finder Quick Action is available only on macOS")
+    destination = quick_action_path()
+    if destination.exists():
+        shutil.rmtree(destination)
+        refresh_services()
+        print(f"removed: {destination}")
+    else:
+        print("Pykno Quick Action is not installed")
+
+
 def planned_jobs(
     inputs: list[Path], args: argparse.Namespace
 ) -> list[tuple[Path, Path]]:
@@ -502,6 +691,20 @@ def planned_jobs(
 
 def main() -> int:
     args = parser().parse_args()
+    if args.install_quick_action or args.uninstall_quick_action:
+        try:
+            if args.inputs:
+                raise RuntimeError("Quick Action commands do not accept PDF inputs")
+            if args.install_quick_action:
+                install_quick_action()
+            else:
+                uninstall_quick_action()
+        except (RuntimeError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        return 0
+    if not args.inputs:
+        parser().error("provide at least one PDF file")
     try:
         settings = checked_settings(args)
     except ValueError as exc:
@@ -526,6 +729,7 @@ def main() -> int:
                 object_size = destination.stat().st_size
                 should_fallback = (
                     args.engine == "auto"
+                    and sys.platform == "darwin"
                     and stats["found"] > 0
                     and (stats["changed"] == 0 or object_size >= before)
                 )

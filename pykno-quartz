@@ -2,7 +2,8 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
-build_dir="$script_dir/.build"
+cache_root="${XDG_CACHE_HOME:-$HOME/Library/Caches}"
+build_dir="$cache_root/Pykno"
 binary="$build_dir/pykno-quartz"
 source_file="$script_dir/Sources/pykno-quartz/main.m"
 
