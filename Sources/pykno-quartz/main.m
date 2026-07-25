@@ -3,7 +3,10 @@
 #import <Quartz/Quartz.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
+#include <sys/stdio.h>
+#include <unistd.h>
 
 typedef NS_ENUM(NSInteger, Engine) { EnginePDFKit, EngineQuartz };
 
@@ -320,6 +323,15 @@ static BOOL ProcessFile(NSString *path, Options *options, NSError **error) {
         URLByAppendingPathComponent:[NSString stringWithFormat:@".%@.%@.tmp",
             outputURL.lastPathComponent, NSUUID.UUID.UUIDString]];
 
+    int temporaryFD = open(temporaryURL.fileSystemRepresentation,
+                           O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (temporaryFD < 0) {
+        *error = CLIError(4, [NSString stringWithFormat:
+            @"Could not securely create temporary output: %s", strerror(errno)]);
+        return NO;
+    }
+    close(temporaryFD);
+
     BOOL compressed = options.engine == EnginePDFKit
         ? CompressWithPDFKit(inputURL, temporaryURL, error)
         : CompressWithQuartz(inputURL, temporaryURL, options, error);
@@ -337,10 +349,16 @@ static BOOL ProcessFile(NSString *path, Options *options, NSError **error) {
         if (sourceAttributes[key]) preservedAttributes[key] = sourceAttributes[key];
     }
     [fm setAttributes:preservedAttributes ofItemAtPath:temporaryURL.path error:nil];
-    if (rename(temporaryURL.fileSystemRepresentation,
-               outputURL.fileSystemRepresentation) != 0) {
-        *error = CLIError(4, [NSString stringWithFormat:
-            @"Could not install output: %s", strerror(errno)]);
+    int renameResult = options.force
+        ? rename(temporaryURL.fileSystemRepresentation,
+                 outputURL.fileSystemRepresentation)
+        : renameatx_np(AT_FDCWD, temporaryURL.fileSystemRepresentation,
+                       AT_FDCWD, outputURL.fileSystemRepresentation, RENAME_EXCL);
+    if (renameResult != 0) {
+        NSString *message = (!options.force && errno == EEXIST)
+            ? [NSString stringWithFormat:@"Output exists (use --force): %@", outputURL.path]
+            : [NSString stringWithFormat:@"Could not install output: %s", strerror(errno)];
+        *error = CLIError(4, message);
         [fm removeItemAtURL:temporaryURL error:nil];
         return NO;
     }

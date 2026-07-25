@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import warnings
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -37,6 +38,14 @@ PRESETS = {
     "balanced": Settings(dpi=144, quality=72),
     "print": Settings(dpi=220, quality=85),
 }
+
+# PDFs are untrusted binary input. These limits allow high-resolution scanned
+# pages while preventing a single document from requesting unbounded decoding
+# or recursive Form traversal.
+MAX_IMAGE_PIXELS = 50_000_000
+MAX_DOCUMENT_PIXELS = 250_000_000
+MAX_FORM_DEPTH = 64
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 
 def parser() -> argparse.ArgumentParser:
@@ -105,8 +114,41 @@ def checked_settings(args: argparse.Namespace) -> Settings:
 
 
 def output_path(source: Path, args: argparse.Namespace) -> Path:
+    if "/" in args.suffix or "\\" in args.suffix or "\0" in args.suffix:
+        raise RuntimeError("--suffix must not contain path separators")
     directory = args.output.expanduser() if args.output else source.parent
     return directory / f"{source.stem}{args.suffix}.pdf"
+
+
+def resolved_output_path(path: Path) -> Path:
+    """Resolve the output directory without following the final path entry."""
+    expanded = path.expanduser()
+    return expanded.parent.resolve() / expanded.name
+
+
+def reject_output_symlink(destination: Path) -> None:
+    """Never allow --force to turn a predictable output symlink into data loss."""
+    if destination.is_symlink():
+        raise RuntimeError(f"refusing to replace an output symlink: {destination}")
+
+
+def install_output(temporary: Path, destination: Path, *, force: bool) -> None:
+    """Atomically install a validated output, respecting no-overwrite mode."""
+    reject_output_symlink(destination)
+    if force:
+        # The final component is intentionally unresolved, so a symlink created
+        # after the check is replaced rather than followed.
+        os.replace(temporary, destination)
+        return
+    try:
+        # The temporary file is in the same directory. Creating a hard link is
+        # an atomic create-if-absent operation on supported local filesystems.
+        os.link(temporary, destination)
+    except FileExistsError:
+        raise RuntimeError(f"output exists (use --force): {destination}") from None
+    except OSError as exc:
+        raise RuntimeError(f"could not atomically install output: {exc}") from exc
+    temporary.unlink()
 
 
 def open_pdf(path: Path, prompt: bool) -> tuple[pikepdf.Pdf, str]:
@@ -149,8 +191,13 @@ def _image_placements(
     resources: pikepdf.Object,
     initial_matrix: pikepdf.Matrix,
     active_forms: set[tuple[int, int] | int],
+    depth: int = 0,
 ) -> Iterator[tuple[pikepdf.Object, pikepdf.Matrix]]:
     """Yield images and their page-space matrices, including nested forms."""
+    if depth >= MAX_FORM_DEPTH:
+        raise RuntimeError(
+            f"PDF Form nesting exceeds the safety limit ({MAX_FORM_DEPTH})"
+        )
     stack = [initial_matrix]
     for instruction in pikepdf.parse_content_stream(
         content, operators="q Q cm Do"
@@ -188,6 +235,7 @@ def _image_placements(
                     form_resources,
                     stack[-1] @ form_matrix,
                     active_forms | {identity},
+                    depth + 1,
                 )
 
 
@@ -219,17 +267,63 @@ def image_dimension_caps(
                     max(previous[0], cap[0]),
                     max(previous[1], cap[1]),
                 )
-        except (pikepdf.PdfError, TypeError, ValueError, NotImplementedError):
+        except (
+            pikepdf.PdfError,
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            RecursionError,
+        ):
             # Malformed content is still handled by the conservative fallback.
             continue
     return caps
 
 
+def _resource_images(
+    resources: pikepdf.Object,
+    active_forms: set[tuple[int, int] | int] | None = None,
+    depth: int = 0,
+) -> Iterator[pikepdf.Object]:
+    """Yield resource images without unbounded recursive Form traversal."""
+    if depth >= MAX_FORM_DEPTH:
+        return
+    active = active_forms or set()
+    try:
+        xobjects = resources.get("/XObject")
+        entries = () if xobjects is None else xobjects.values()
+        for obj in entries:
+            subtype = obj.get("/Subtype")
+            if subtype == pikepdf.Name.Image:
+                yield obj
+            elif subtype == pikepdf.Name.Form:
+                identity = object_identity(obj)
+                if identity in active:
+                    continue
+                form_resources = obj.get("/Resources", resources)
+                yield from _resource_images(
+                    form_resources,
+                    active | {identity},
+                    depth + 1,
+                )
+    except (pikepdf.PdfError, TypeError, ValueError, RuntimeError, RecursionError):
+        return
+
+
 def raw_length(obj: pikepdf.Object) -> int:
     try:
-        return len(obj.read_raw_bytes())
-    except (pikepdf.PdfError, ValueError):
-        return int(obj.get("/Length", 0))
+        return max(0, int(obj.get("/Length", 0)))
+    except (pikepdf.PdfError, TypeError, ValueError):
+        return 0
+
+
+def image_pixel_count(obj: pikepdf.Object) -> int:
+    try:
+        width = int(obj.get("/Width", 0))
+        height = int(obj.get("/Height", 0))
+    except (pikepdf.PdfError, TypeError, ValueError):
+        return 0
+    return max(0, width) * max(0, height)
 
 
 def compress_image(
@@ -246,11 +340,20 @@ def compress_image(
 
     before = raw_length(obj)
     try:
-        with pikepdf.PdfImage(obj).as_pil_image(
-            apply_decode_array=True, apply_mask=False
-        ) as extracted:
-            image = extracted.copy()
-    except (pikepdf.PdfError, ValueError, OSError, NotImplementedError) as exc:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with pikepdf.PdfImage(obj).as_pil_image(
+                apply_decode_array=True, apply_mask=False
+            ) as extracted:
+                image = extracted.copy()
+    except (
+        pikepdf.PdfError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+        ValueError,
+        OSError,
+        NotImplementedError,
+    ) as exc:
         return False, before, before, f"decode failed: {type(exc).__name__}"
 
     if image.mode == "L":
@@ -310,11 +413,12 @@ def compress_pdf(
     args: argparse.Namespace,
 ) -> dict[str, int]:
     source = source.expanduser().resolve()
-    destination = destination.expanduser().resolve()
+    destination = resolved_output_path(destination)
     if not source.is_file() or source.suffix.lower() != ".pdf":
         raise RuntimeError("input does not exist or is not a PDF file")
     if source == destination:
         raise RuntimeError("refusing to overwrite the input file")
+    reject_output_symlink(destination)
     if destination.exists() and not args.force:
         raise RuntimeError(f"output exists (use --force): {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -327,6 +431,7 @@ def compress_pdf(
         fallback_cap = page_dimension_cap(pdf, settings.dpi)
         placement_caps = image_dimension_caps(pdf, settings.dpi)
         visited: set[tuple[int, int] | int] = set()
+        decoded_pixels = 0
         stats = {
             "found": 0,
             "changed": 0,
@@ -336,12 +441,27 @@ def compress_pdf(
         }
 
         for page in pdf.pages:
-            for obj in page.get_images(recursive=True).values():
+            try:
+                page_images = _resource_images(page.resources)
+            except AttributeError:
+                continue
+            for obj in page_images:
                 identity = object_identity(obj)
                 if identity in visited:
                     continue
                 visited.add(identity)
                 stats["found"] += 1
+                pixels = image_pixel_count(obj)
+                if (
+                    pixels > MAX_IMAGE_PIXELS
+                    or decoded_pixels + pixels > MAX_DOCUMENT_PIXELS
+                ):
+                    before = raw_length(obj)
+                    stats["before"] += before
+                    stats["after"] += before
+                    stats["skipped"] += 1
+                    continue
+                decoded_pixels += pixels
                 changed, before, after, _detail = compress_image(
                     obj,
                     max_size=placement_caps.get(identity, fallback_cap),
@@ -391,7 +511,7 @@ def compress_pdf(
             raise RuntimeError(f"output validation failed: {exc}") from exc
 
         shutil.copystat(source, temporary)
-        os.replace(temporary, destination)
+        install_output(temporary, destination, force=args.force)
     finally:
         pdf.close()
         if temporary is not None:
@@ -410,11 +530,12 @@ def compress_quartz(
 ) -> None:
     """Invoke the bundled local macOS Quartz engine."""
     source = source.expanduser().resolve()
-    destination = destination.expanduser().resolve()
+    destination = resolved_output_path(destination)
     if not source.is_file() or source.suffix.lower() != ".pdf":
         raise RuntimeError("input does not exist or is not a PDF file")
     if source == destination:
         raise RuntimeError("refusing to overwrite the input file")
+    reject_output_symlink(destination)
     if destination.exists() and not (args.force or replace):
         raise RuntimeError(f"output exists (use --force): {destination}")
     if sys.platform != "darwin":
@@ -647,6 +768,8 @@ def install_quick_action() -> None:
     if sys.platform != "darwin":
         raise RuntimeError("the Finder Quick Action is available only on macOS")
     destination = quick_action_path()
+    if destination.is_symlink():
+        raise RuntimeError(f"refusing to install through a symlink: {destination}")
     contents = destination / "Contents"
     contents.mkdir(parents=True, exist_ok=True)
     with (contents / "Info.plist").open("wb") as stream:
@@ -661,6 +784,8 @@ def uninstall_quick_action() -> None:
     if sys.platform != "darwin":
         raise RuntimeError("the Finder Quick Action is available only on macOS")
     destination = quick_action_path()
+    if destination.is_symlink():
+        raise RuntimeError(f"refusing to remove a symlinked workflow: {destination}")
     if destination.exists():
         shutil.rmtree(destination)
         refresh_services()
@@ -677,7 +802,7 @@ def planned_jobs(
     destinations: dict[Path, Path] = {}
     for source_arg in inputs:
         source = source_arg.expanduser()
-        destination = output_path(source, args).expanduser().resolve()
+        destination = resolved_output_path(output_path(source, args))
         previous = destinations.get(destination)
         if previous is not None:
             raise RuntimeError(

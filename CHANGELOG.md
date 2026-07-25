@@ -12,6 +12,13 @@ The format follows Keep a Changelog, and the project intends to use Semantic Ver
 - Configurable Finder Quick Action installer and uninstaller.
 - Explicit non-macOS behavior for Quartz and automatic mode.
 
+### Security
+
+- Prevent forced output from following symbolic links.
+- Make no-overwrite output installation atomic in both compression engines.
+- Bound decoded image pixels and nested PDF Form traversal.
+- Pin CI actions to immutable commits and enable Dependabot updates.
+
 ## [0.1.0] - 2026-07-24
 
 ### Added

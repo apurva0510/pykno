@@ -109,8 +109,9 @@ Neither engine performs OCR. For a locked PDF, add --password-prompt. The passwo
 - The recommended engine uses only pikepdf/QPDF, Pillow, and local files.
 - Output is first written to a temporary file, reopened, and checked for the same nonzero page count.
 - The temporary file is moved into place only after validation.
-- Existing output is preserved unless --force is supplied.
+- Existing output is preserved atomically unless --force is supplied, and output symlinks are always rejected.
 - The input path can never be the output path.
+- The object engine bounds decoded image pixels and nested Form traversal when processing malformed or hostile PDFs.
 
 For highly sensitive documents, remember that Spotlight, Time Machine, cloud-synced folders, and other system services are separate from this program. Use a nonsynced local directory if those matter to your threat model.
 

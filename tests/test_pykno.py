@@ -73,8 +73,117 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "same output"):
             pykno.planned_jobs(inputs, args)
 
+    def test_suffix_cannot_escape_output_directory(self) -> None:
+        args = compression_args(suffix="/../../escaped")
+        with self.assertRaisesRegex(RuntimeError, "path separators"):
+            pykno.planned_jobs([Path("report.pdf")], args)
+
+
+class OutputSafetyTests(unittest.TestCase):
+    def test_force_rejects_existing_output_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.pdf"
+            victim = root / "victim.txt"
+            destination = root / "source-compressed.pdf"
+            make_image_pdf(source)
+            victim.write_text("keep me")
+            destination.symlink_to(victim)
+
+            with self.assertRaisesRegex(RuntimeError, "output symlink"):
+                pykno.compress_pdf(
+                    source,
+                    destination,
+                    pykno.Settings(144, 72),
+                    compression_args(force=True),
+                )
+
+            self.assertEqual(victim.read_text(), "keep me")
+            self.assertTrue(destination.is_symlink())
+
+    def test_atomic_install_refuses_file_created_after_initial_check(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            temporary = root / "temporary.pdf"
+            destination = root / "result.pdf"
+            temporary.write_bytes(b"validated output")
+
+            def race(_source: Path, target: Path) -> None:
+                target.write_bytes(b"other process")
+                raise FileExistsError
+
+            with mock.patch.object(pykno.os, "link", side_effect=race):
+                with self.assertRaisesRegex(RuntimeError, "output exists"):
+                    pykno.install_output(temporary, destination, force=False)
+
+            self.assertEqual(destination.read_bytes(), b"other process")
+            self.assertEqual(temporary.read_bytes(), b"validated output")
+
 
 class PdfCompressionTests(unittest.TestCase):
+    def test_oversized_image_is_not_decoded(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        page = pdf.add_blank_page(page_size=(612, 792))
+        image = pdf.make_stream(b"not decoded")
+        image["/Type"] = pikepdf.Name.XObject
+        image["/Subtype"] = pikepdf.Name.Image
+        image["/Width"] = pykno.MAX_IMAGE_PIXELS + 1
+        image["/Height"] = 1
+        image["/ColorSpace"] = pikepdf.Name.DeviceGray
+        image["/BitsPerComponent"] = 8
+        page.Resources = pikepdf.Dictionary(
+            XObject=pikepdf.Dictionary(Image=image)
+        )
+        page.Contents = pdf.make_stream(b"/Image Do")
+
+        with mock.patch.object(
+            pykno, "compress_image", side_effect=AssertionError("decoded")
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "source.pdf"
+                destination = Path(directory) / "result.pdf"
+                pdf.save(source)
+                stats = pykno.compress_pdf(
+                    source,
+                    destination,
+                    pykno.Settings(144, 72),
+                    compression_args(),
+                )
+
+        self.assertEqual(stats["found"], 1)
+        self.assertEqual(stats["skipped"], 1)
+
+    def test_form_traversal_has_a_depth_limit(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        resources = pikepdf.Dictionary()
+        content = pdf.make_stream(b"")
+        with self.assertRaisesRegex(RuntimeError, "nesting exceeds"):
+            list(
+                pykno._image_placements(
+                    content,
+                    resources,
+                    pikepdf.Matrix.identity(),
+                    set(),
+                    pykno.MAX_FORM_DEPTH,
+                )
+            )
+
+    def test_resource_traversal_stops_at_depth_limit(self) -> None:
+        pdf = pikepdf.Pdf.new()
+        image = make_image_xobject(pdf)
+        resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Image=image))
+        for _ in range(pykno.MAX_FORM_DEPTH + 5):
+            form = pdf.make_stream(b"")
+            form["/Type"] = pikepdf.Name.XObject
+            form["/Subtype"] = pikepdf.Name.Form
+            form["/BBox"] = pikepdf.Array((0, 0, 10, 10))
+            form["/Resources"] = resources
+            resources = pikepdf.Dictionary(
+                XObject=pikepdf.Dictionary(Form=form)
+            )
+
+        self.assertEqual(list(pykno._resource_images(resources)), [])
+
     def test_nested_form_and_shared_placements_use_largest_rendered_size(self) -> None:
         pdf = pikepdf.Pdf.new()
         image = make_image_xobject(pdf)
