@@ -1,0 +1,13 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+python="$script_dir/.venv/bin/python"
+
+if [[ ! -x "$python" ]]; then
+  print -u2 "error: local Python environment is missing"
+  print -u2 "run: ./setup-pykno"
+  exit 2
+fi
+
+exec "$python" "$script_dir/pykno.py" "$@"

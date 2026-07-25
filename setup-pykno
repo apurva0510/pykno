@@ -1,0 +1,12 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+cd "$script_dir"
+
+python3 -m venv .venv
+.venv/bin/python -m pip install --disable-pip-version-check -r requirements.txt
+
+print
+print "Setup complete. Compress a PDF with:"
+print "  ./pykno /path/to/document.pdf"

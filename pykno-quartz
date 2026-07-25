@@ -1,0 +1,19 @@
+#!/bin/zsh
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+build_dir="$script_dir/.build"
+binary="$build_dir/pykno-quartz"
+source_file="$script_dir/Sources/pykno-quartz/main.m"
+
+if [[ ! -x "$binary" || "$source_file" -nt "$binary" ]]; then
+  mkdir -p "$build_dir"
+  CLANG_MODULE_CACHE_PATH="$build_dir/module-cache" clang -fobjc-arc -fmodules \
+    -framework Foundation \
+    -framework PDFKit \
+    -framework Quartz \
+    -framework CoreGraphics \
+    "$source_file" -o "$binary"
+fi
+
+exec "$binary" "$@"

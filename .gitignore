@@ -1,0 +1,6 @@
+.build/
+.venv/
+__pycache__/
+tmp/
+output/
+*-compressed.pdf
