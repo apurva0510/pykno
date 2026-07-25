@@ -4,3 +4,4 @@ __pycache__/
 tmp/
 output/
 *-compressed.pdf
+REVERSE_ENGINEERING.md
