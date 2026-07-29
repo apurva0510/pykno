@@ -11,10 +11,11 @@ These packages do not upload or remotely process documents. Installation tools m
 
 ## Install
 
-Until versioned packages are published, clone the repository and install an isolated command with `pipx`:
+Install uv, clone the repository, and install an isolated command:
 
 ```Shell
-pipx install .
+brew install uv
+uv tool install .
 pykno --version
 ```
 
@@ -117,11 +118,10 @@ For highly sensitive documents, remember that Spotlight, Time Machine, cloud-syn
 
 ## Python environment
 
-Dependencies are isolated under .venv and listed in requirements.txt. To rebuild the environment:
+Dependencies are isolated under `.venv` and reproduced from `uv.lock`. To rebuild the environment:
 
 ```Shell
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+uv sync --locked
 ```
 
 ## Platform support
@@ -147,7 +147,7 @@ This is an independent clean-room implementation based on documented PDF and mac
 Run the test suite with:
 
 ```Shell
-.venv/bin/python -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests -v
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance and [SECURITY.md](SECURITY.md) for responsible vulnerability reporting.

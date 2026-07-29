@@ -8,7 +8,7 @@ Pykno currently targets macOS for its complete feature set. The object engine is
 
 ```Shell
 ./setup-pykno
-.venv/bin/python -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests -v
 ```
 
 ## Pull requests

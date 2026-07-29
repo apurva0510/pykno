@@ -4,8 +4,13 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 cd "$script_dir"
 
-python3 -m venv .venv
-.venv/bin/python -m pip install --disable-pip-version-check --editable .
+if ! command -v uv >/dev/null 2>&1; then
+  print -u2 "error: uv is required"
+  print -u2 "install it with: brew install uv"
+  exit 2
+fi
+
+uv sync --locked
 
 print
 print "Setup complete. Compress a PDF with:"

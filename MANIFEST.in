@@ -2,7 +2,7 @@ include CHANGELOG.md
 include CONTRIBUTING.md
 include LICENSE
 include SECURITY.md
-include requirements.txt
+include uv.lock
 include setup-pykno
 include pykno
 include pykno-quartz

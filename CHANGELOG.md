@@ -11,6 +11,7 @@ The format follows Keep a Changelog, and the project intends to use Semantic Ver
 - Installable Python console command through `pyproject.toml`.
 - Configurable Finder Quick Action installer and uninstaller.
 - Explicit non-macOS behavior for Quartz and automatic mode.
+- Reproducible uv-based development, testing, and CI workflows.
 
 ### Security
 
