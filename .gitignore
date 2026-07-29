@@ -8,3 +8,4 @@ REVERSE_ENGINEERING.md
 build/
 dist/
 *.egg-info/
+.DS_Store
