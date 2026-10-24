@@ -22,7 +22,7 @@ classifiers = [
 ]
 dependencies = [
   "pikepdf>=10.10,<11",
-  "Pillow>=12.3,<13",
+  "Pillow>=12.3,<14",
 ]
 
 [project.urls]
